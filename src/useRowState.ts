@@ -47,9 +47,6 @@ const REALTIME_POSTGRES_CHANGES_LISTEN_EVENT = {
 type RealtimeListenType = typeof REALTIME_LISTEN_TYPES[keyof typeof REALTIME_LISTEN_TYPES]
 type PostgresChangesEvent = typeof REALTIME_POSTGRES_CHANGES_LISTEN_EVENT[keyof typeof REALTIME_POSTGRES_CHANGES_LISTEN_EVENT]
 
-// Memoize the Supabase client since it's a singleton
-const supabase = getSupabaseClient()
-
 /**
  * A React hook that syncs a local state with a row in a Supabase table.
  * @template T The type of the row data
@@ -85,20 +82,23 @@ export function useSupabaseRowState<
     return [null, createNoopSetter<T>(), false, () => {}]
   }
 
+  const supabase = getSupabaseClient()
   const [data, setData] = useState<RowState<T>>(null)
   const [isLoaded, setIsLoaded] = useState(false)
   const channelRef = useRef<RealtimeChannel | null>(null)
+  const subscriptionRef = useRef<boolean>(false)
 
   // Memoize channel key for stable subscriptions
   const channelKey = useMemo(() => `realtime-${table}-${rowId}`, [table, rowId])
 
-  // Check for existing channel subscription
-  useEffect(() => {
-    const existingChannel = supabase.getChannels().find(ch => ch.subscribe().topic === channelKey)
-    if (existingChannel) {
-      logger(`Warning: Channel ${channelKey} already exists. This might cause duplicate subscriptions.`)
+  // Cleanup function for subscriptions
+  const cleanup = useCallback(() => {
+    if (channelRef.current) {
+      supabase.removeChannel(channelRef.current)
+      channelRef.current = null
+      subscriptionRef.current = false
     }
-  }, [channelKey, logger])
+  }, [])
 
   // Fetch initial row
   useEffect(() => {
@@ -134,10 +134,11 @@ export function useSupabaseRowState<
 
   // Realtime subscription
   useEffect(() => {
+    // Skip if already subscribed
+    if (subscriptionRef.current) return
+
     // Cleanup previous subscription
-    if (channelRef.current) {
-      supabase.removeChannel(channelRef.current)
-    }
+    cleanup()
 
     const channel = supabase
       .channel(channelKey)
@@ -160,14 +161,17 @@ export function useSupabaseRowState<
           }
         }
       )
-      .subscribe()
 
+    // Subscribe and store the channel
     channelRef.current = channel
+    channel.subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        subscriptionRef.current = true
+      }
+    })
 
-    return () => {
-      supabase.removeChannel(channel)
-    }
-  }, [table, rowId, schema, primaryKey, channelKey])
+    return cleanup
+  }, [table, rowId, schema, primaryKey, channelKey, cleanup])
 
   // Optimistic setter
   const setRow = useCallback((updater: RowUpdater<T>) => {
@@ -192,13 +196,7 @@ export function useSupabaseRowState<
     })
   }, [autoSync, table, primaryKey, rowId, logger])
 
-  const unsubscribe = useCallback(() => {
-    if (channelRef.current) {
-      supabase.removeChannel(channelRef.current)
-    }
-  }, [])
-
-  return [data, setRow, isLoaded, unsubscribe]
+  return [data, setRow, isLoaded, cleanup]
 }
 
 // Export a named return type for better documentation and tooling
